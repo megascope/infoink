@@ -25,7 +25,9 @@ LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL_SECONDS = 5
 FULL_REFRESH_EVERY_N_UPDATES = 30
-PAGES = ("IP Addresses", "Wi-Fi", "Clock")
+NETWORK_CACHE_TTL_SECONDS = 60
+ADMIN_PAGE_INDEX = 3
+PAGES = ("IP Addresses", "Wi-Fi", "Clock", "Admin")
 
 DISPLAY_WIDTH = 250
 DISPLAY_HEIGHT = 122
@@ -33,6 +35,16 @@ SIDEBAR_X0 = 220
 UP_BUTTON = (223, 8, 247, 56)
 DOWN_BUTTON = (223, 66, 247, 114)
 TOUCH_DEBOUNCE_SECONDS = 0.25
+TOUCH_POLL_IDLE_SECONDS = 0.12
+TOUCH_POLL_ACTIVE_SECONDS = 0.03
+ADMIN_CONFIRM_WINDOW_SECONDS = 5.0
+
+ADMIN_REBOOT_BUTTON = (14, 36, 110, 54)
+ADMIN_SHUTDOWN_BUTTON = (14, 74, 110, 92)
+ADMIN_CONFIRM_BUTTON = (222, 40, 248, 82)
+
+_IP_CACHE = {"updated_at": 0.0, "value": []}
+_WIFI_CACHE = {"updated_at": 0.0, "value": []}
 
 
 def get_non_loopback_ipv4():
@@ -99,6 +111,20 @@ def get_connected_wifi_networks():
     return wifi_links
 
 
+def get_non_loopback_ipv4_cached(now_mono):
+    if (now_mono - _IP_CACHE["updated_at"]) >= NETWORK_CACHE_TTL_SECONDS:
+        _IP_CACHE["value"] = get_non_loopback_ipv4()
+        _IP_CACHE["updated_at"] = now_mono
+    return _IP_CACHE["value"]
+
+
+def get_connected_wifi_networks_cached(now_mono):
+    if (now_mono - _WIFI_CACHE["updated_at"]) >= NETWORK_CACHE_TTL_SECONDS:
+        _WIFI_CACHE["value"] = get_connected_wifi_networks()
+        _WIFI_CACHE["updated_at"] = now_mono
+    return _WIFI_CACHE["value"]
+
+
 def load_font(size):
     for name in ("Roboto-Regular.ttf", "Font.ttc"):
         path = os.path.join(fontdir, name)
@@ -107,20 +133,25 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-def draw_sidebar(draw, font_button):
+def draw_sidebar(draw, font_button, show_confirm=False):
     draw.rectangle((SIDEBAR_X0, 0, DISPLAY_WIDTH - 1, DISPLAY_HEIGHT - 1), outline=0, fill=255, width=1)
     draw.text((223, 1), "MENU", font=font_button, fill=0)
 
-    draw.rectangle(UP_BUTTON, outline=0, fill=255, width=1)
-    draw.polygon([(235, 16), (229, 26), (241, 26)], fill=0)
-    draw.text((229, 32), "UP", font=font_button, fill=0)
+    if show_confirm:
+        draw.rectangle(ADMIN_CONFIRM_BUTTON, outline=0, fill=255, width=1)
+        draw.text((224, 50), "CONF", font=font_button, fill=0)
+        draw.text((225, 62), "IRM", font=font_button, fill=0)
+    else:
+        draw.rectangle(UP_BUTTON, outline=0, fill=255, width=1)
+        draw.polygon([(235, 16), (229, 26), (241, 26)], fill=0)
+        draw.text((229, 32), "UP", font=font_button, fill=0)
 
-    draw.rectangle(DOWN_BUTTON, outline=0, fill=255, width=1)
-    draw.polygon([(235, 106), (229, 96), (241, 96)], fill=0)
-    draw.text((225, 72), "DOWN", font=font_button, fill=0)
+        draw.rectangle(DOWN_BUTTON, outline=0, fill=255, width=1)
+        draw.polygon([(235, 106), (229, 96), (241, 96)], fill=0)
+        draw.text((225, 72), "DOWN", font=font_button, fill=0)
 
 
-def build_frame(page, font_title, font_body, font_button):
+def build_frame(page, font_title, font_body, font_button, armed_admin_action="", armed_seconds_left=0):
     image = Image.new("1", (DISPLAY_WIDTH, DISPLAY_HEIGHT), 255)
     draw = ImageDraw.Draw(image)
 
@@ -130,25 +161,39 @@ def build_frame(page, font_title, font_body, font_button):
     draw.line((2, 21, SIDEBAR_X0 - 3, 21), fill=0, width=1)
     draw.line((2, 28, SIDEBAR_X0 - 3, 28), fill=0, width=1)
 
+    now_mono = time.monotonic()
     if page == 0:
-        rows = [f"{ifname}: {ip}" for ifname, ip in get_non_loopback_ipv4()]
+        rows = [f"{ifname}: {ip}" for ifname, ip in get_non_loopback_ipv4_cached(now_mono)]
         if not rows:
             rows = ["No non-loopback", "IPv4 addresses"]
     elif page == 1:
-        rows = [f"{ifname}: {ssid}" for ifname, ssid in get_connected_wifi_networks()]
+        rows = [f"{ifname}: {ssid}" for ifname, ssid in get_connected_wifi_networks_cached(now_mono)]
         if not rows:
             rows = ["No connected Wi-Fi", "networks detected"]
-    else:
+    elif page == 2:
         rows = [now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d")]
+    else:
+        rows = []
 
-    y = 36
-    for row in rows:
-        draw.text((4, y), row, font=font_title if page == 2 else font_body, fill=0)
-        y += 24 if page == 2 else 14
-        if y > DISPLAY_HEIGHT - 4:
-            break
+    if page == ADMIN_PAGE_INDEX:
+        draw.rectangle(ADMIN_REBOOT_BUTTON, outline=0, fill=255, width=1)
+        draw.text((22, 40), "Reboot", font=font_button, fill=0)
 
-    draw_sidebar(draw, font_button)
+        draw.rectangle(ADMIN_SHUTDOWN_BUTTON, outline=0, fill=255, width=1)
+        draw.text((22, 78), "Shutdown", font=font_button, fill=0)
+        if armed_admin_action:
+            confirm_label = "REBOOT" if armed_admin_action == "reboot" else "SHUTDOWN"
+            draw.text((8, 102), f"Tap CONFIRM at right ({armed_seconds_left}s)", font=font_button, fill=0)
+            draw.text((8, 112), f"Armed: {confirm_label}", font=font_button, fill=0)
+    else:
+        y = 36
+        for row in rows:
+            draw.text((4, y), row, font=font_title if page == 2 else font_body, fill=0)
+            y += 24 if page == 2 else 14
+            if y > DISPLAY_HEIGHT - 4:
+                break
+
+    draw_sidebar(draw, font_button, show_confirm=(page == ADMIN_PAGE_INDEX and bool(armed_admin_action)))
     return image
 
 
@@ -183,6 +228,15 @@ def create_runtime(simulator, simulator_host, simulator_port):
     return epd, gt, gt_dev, gt_old, None
 
 
+def trigger_admin_action(action):
+    if action == "reboot":
+        LOGGER.warning("Running: sudo reboot")
+        subprocess.Popen(["sudo", "reboot"])
+    elif action == "shutdown":
+        LOGGER.warning("Running: sudo shutdown -h now")
+        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+
+
 def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
     epd, gt, gt_dev, gt_old, sim_server = create_runtime(simulator, simulator_host, simulator_port)
 
@@ -196,6 +250,8 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
     next_update_at = 0.0
     last_page_touch = 0.0
     touch_latched = False
+    armed_admin_action = ""
+    armed_admin_expires_at = 0.0
 
     try:
         if simulator:
@@ -216,7 +272,17 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
             now = time.monotonic()
 
             if now >= next_update_at or force_redraw:
-                image = build_frame(current_page, font_title, font_body, font_button)
+                seconds_left = 0
+                if armed_admin_action:
+                    seconds_left = max(0, int(armed_admin_expires_at - now))
+                image = build_frame(
+                    current_page,
+                    font_title,
+                    font_body,
+                    font_button,
+                    armed_admin_action=armed_admin_action if current_page == ADMIN_PAGE_INDEX else "",
+                    armed_seconds_left=seconds_left,
+                )
                 update_count += 1
 
                 if update_count >= FULL_REFRESH_EVERY_N_UPDATES:
@@ -233,15 +299,30 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
             int_is_low = gt.digital_read(gt.INT) == 0
             if int_is_low:
                 gt_dev.Touch = 1
+                gt.GT_Scan(gt_dev, gt_old)
             else:
                 touch_latched = False
 
-            gt.GT_Scan(gt_dev, gt_old)
             if gt_dev.TouchpointFlag:
                 gt_dev.TouchpointFlag = 0
                 raw_x = gt_dev.X[0]
                 raw_y = gt_dev.Y[0]
                 x, y = raw_touch_to_landscape(raw_x, raw_y)
+
+                if (
+                    current_page == ADMIN_PAGE_INDEX
+                    and armed_admin_action
+                    and x >= SIDEBAR_X0
+                ):
+                    touch_latched = True
+                    if is_inside(ADMIN_CONFIRM_BUTTON, x, y) and now <= armed_admin_expires_at:
+                        trigger_admin_action(armed_admin_action)
+                    else:
+                        LOGGER.warning("Admin action canceled (confirmation zone not tapped).")
+                    armed_admin_action = ""
+                    force_redraw = True
+                    time.sleep(TOUCH_POLL_ACTIVE_SECONDS if int_is_low else TOUCH_POLL_IDLE_SECONDS)
+                    continue
 
                 if (
                     not touch_latched
@@ -253,13 +334,45 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
                         force_redraw = True
                         last_page_touch = now
                         touch_latched = True
+                        armed_admin_action = ""
                     elif is_inside(DOWN_BUTTON, x, y):
                         current_page = (current_page + 1) % len(PAGES)
                         force_redraw = True
                         last_page_touch = now
                         touch_latched = True
+                        armed_admin_action = ""
 
-            time.sleep(0.05)
+                if current_page == ADMIN_PAGE_INDEX and x < SIDEBAR_X0:
+                    tapped_action = ""
+                    if is_inside(ADMIN_REBOOT_BUTTON, x, y):
+                        tapped_action = "reboot"
+                    elif is_inside(ADMIN_SHUTDOWN_BUTTON, x, y):
+                        tapped_action = "shutdown"
+
+                    if tapped_action:
+                        touch_latched = True
+                        if (
+                            armed_admin_action == tapped_action
+                            and now <= armed_admin_expires_at
+                        ):
+                            trigger_admin_action(tapped_action)
+                            armed_admin_action = ""
+                            force_redraw = True
+                        else:
+                            armed_admin_action = tapped_action
+                            armed_admin_expires_at = now + ADMIN_CONFIRM_WINDOW_SECONDS
+                            LOGGER.warning(
+                                "Admin action '%s' armed. Tap CONFIRM on the right within %.0fs.",
+                                tapped_action,
+                                ADMIN_CONFIRM_WINDOW_SECONDS,
+                            )
+                            force_redraw = True
+
+            if armed_admin_action and now > armed_admin_expires_at:
+                armed_admin_action = ""
+                force_redraw = True
+
+            time.sleep(TOUCH_POLL_ACTIVE_SECONDS if int_is_low else TOUCH_POLL_IDLE_SECONDS)
     except KeyboardInterrupt:
         LOGGER.info("Exiting...")
     finally:
