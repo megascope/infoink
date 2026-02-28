@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import struct
+import subprocess
 import sys
 import time
 
@@ -16,13 +17,21 @@ fontdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pic")
 if os.path.exists(libdir):
     sys.path.append(libdir)
 
-from TP_lib import epd2in13_V4
+from TP_lib import epd2in13_V4, gt1151
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL_SECONDS = 5
 FULL_REFRESH_EVERY_N_UPDATES = 30
+PAGES = ("IP Addresses", "Wi-Fi", "Clock")
+
+DISPLAY_WIDTH = 250
+DISPLAY_HEIGHT = 122
+SIDEBAR_X0 = 220
+UP_BUTTON = (223, 8, 247, 56)
+DOWN_BUTTON = (223, 66, 247, 114)
+TOUCH_DEBOUNCE_SECONDS = 0.25
 
 
 def get_non_loopback_ipv4():
@@ -46,6 +55,49 @@ def get_non_loopback_ipv4():
     return addresses
 
 
+def get_connected_wifi_networks():
+    wifi_links = []
+    net_dir = "/sys/class/net"
+    try:
+        interfaces = sorted(os.listdir(net_dir))
+    except OSError:
+        return wifi_links
+
+    for ifname in interfaces:
+        if not os.path.isdir(os.path.join(net_dir, ifname, "wireless")):
+            continue
+
+        ssid = ""
+        try:
+            ssid = subprocess.check_output(
+                ["iwgetid", ifname, "--raw"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            ssid = ""
+
+        if not ssid:
+            try:
+                link_out = subprocess.check_output(
+                    ["iw", "dev", ifname, "link"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                for line in link_out.splitlines():
+                    line = line.strip()
+                    if line.startswith("SSID:"):
+                        ssid = line.split(":", 1)[1].strip()
+                        break
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                ssid = ""
+
+        if ssid:
+            wifi_links.append((ifname, ssid))
+
+    return wifi_links
+
+
 def load_font(size):
     for name in ("Roboto-Regular.ttf", "Font.ttc"):
         path = os.path.join(fontdir, name)
@@ -54,60 +106,137 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-def build_frame(epd, font_title, font_body):
-    image = Image.new("1", (epd.height, epd.width), 255)
+def draw_sidebar(draw, font_button):
+    draw.rectangle((SIDEBAR_X0, 0, DISPLAY_WIDTH - 1, DISPLAY_HEIGHT - 1), outline=0, fill=255, width=1)
+    draw.text((223, 1), "MENU", font=font_button, fill=0)
+
+    draw.rectangle(UP_BUTTON, outline=0, fill=255, width=1)
+    draw.polygon([(235, 16), (229, 26), (241, 26)], fill=0)
+    draw.text((229, 32), "UP", font=font_button, fill=0)
+
+    draw.rectangle(DOWN_BUTTON, outline=0, fill=255, width=1)
+    draw.polygon([(235, 106), (229, 96), (241, 96)], fill=0)
+    draw.text((225, 72), "DOWN", font=font_button, fill=0)
+
+
+def build_frame(page, font_title, font_body, font_button):
+    image = Image.new("1", (DISPLAY_WIDTH, DISPLAY_HEIGHT), 255)
     draw = ImageDraw.Draw(image)
 
     now = datetime.datetime.now()
-    draw.text((6, 4), "Network Monitor", font=font_title, fill=0)
-    draw.line((6, 24, epd.height - 6, 24), fill=0, width=1)
-    draw.text((6, 28), now.strftime("Updated: %Y-%m-%d %H:%M:%S"), font=font_body, fill=0)
+    draw.rectangle((0, 0, SIDEBAR_X0 - 1, DISPLAY_HEIGHT - 1), outline=0, fill=255, width=1)
+    draw.text((4, 4), PAGES[page], font=font_title, fill=0)
+    draw.line((2, 21, SIDEBAR_X0 - 3, 21), fill=0, width=1)
+    draw.line((2, 28, SIDEBAR_X0 - 3, 28), fill=0, width=1)
 
-    y = 48
-    for ifname, ip in get_non_loopback_ipv4():
-        draw.text((6, y), f"{ifname}: {ip}", font=font_body, fill=0)
-        y += 18
-        if y > epd.width - 16:
+    if page == 0:
+        rows = [f"{ifname}: {ip}" for ifname, ip in get_non_loopback_ipv4()]
+        if not rows:
+            rows = ["No non-loopback", "IPv4 addresses"]
+    elif page == 1:
+        rows = [f"{ifname}: {ssid}" for ifname, ssid in get_connected_wifi_networks()]
+        if not rows:
+            rows = ["No connected Wi-Fi", "networks detected"]
+    else:
+        rows = [now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d")]
+
+    y = 36
+    for row in rows:
+        draw.text((4, y), row, font=font_title if page == 2 else font_body, fill=0)
+        y += 24 if page == 2 else 14
+        if y > DISPLAY_HEIGHT - 4:
             break
 
-    if y == 48:
-        draw.text((6, y), "No non-loopback IPv4 addresses", font=font_body, fill=0)
-
+    draw_sidebar(draw, font_button)
     return image
+
+
+def is_inside(rect, x, y):
+    x0, y0, x1, y1 = rect
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
+def raw_touch_to_landscape(raw_x, raw_y):
+    # getbuffer() rotates landscape images by 270 degrees to panel space.
+    # Inverse-map raw panel touch back into landscape display coordinates.
+    return (DISPLAY_WIDTH - 1) - raw_y, (DISPLAY_HEIGHT - 1) - raw_x
 
 
 def main():
     epd = epd2in13_V4.EPD()
-    font_title = load_font(18)
-    font_body = load_font(14)
+    gt = gt1151.GT1151()
+    gt_dev = gt1151.GT_Development()
+    gt_old = gt1151.GT_Development()
+
+    font_title = load_font(14)
+    font_body = load_font(12)
+    font_button = load_font(10)
+
     update_count = 0
+    current_page = 0
+    force_redraw = True
+    next_update_at = 0.0
+    last_page_touch = 0.0
 
     try:
-        LOGGER.info("Initializing Waveshare 2.13 V4 display")
+        LOGGER.info("Initializing Waveshare 2.13 V4 display + touch")
         epd.init(epd.FULL_UPDATE)
+        gt.GT_Init()
         epd.Clear(0xFF)
 
-        base_image = build_frame(epd, font_title, font_body)
+        base_image = build_frame(current_page, font_title, font_body, font_button)
         epd.displayPartBaseImage(epd.getbuffer(base_image))
         epd.init(epd.PART_UPDATE)
+        next_update_at = time.monotonic()
 
         while True:
-            time.sleep(UPDATE_INTERVAL_SECONDS)
-            image = build_frame(epd, font_title, font_body)
-            update_count += 1
+            now = time.monotonic()
 
-            if update_count >= FULL_REFRESH_EVERY_N_UPDATES:
-                epd.init(epd.FULL_UPDATE)
-                epd.displayPartBaseImage(epd.getbuffer(image))
-                epd.init(epd.PART_UPDATE)
-                update_count = 0
-            else:
-                epd.displayPartial_Wait(epd.getbuffer(image))
+            if now >= next_update_at or force_redraw:
+                image = build_frame(current_page, font_title, font_body, font_button)
+                update_count += 1
+
+                if update_count >= FULL_REFRESH_EVERY_N_UPDATES:
+                    epd.init(epd.FULL_UPDATE)
+                    epd.displayPartBaseImage(epd.getbuffer(image))
+                    epd.init(epd.PART_UPDATE)
+                    update_count = 0
+                else:
+                    epd.displayPartial_Wait(epd.getbuffer(image))
+
+                next_update_at = now + UPDATE_INTERVAL_SECONDS
+                force_redraw = False
+
+            if gt.digital_read(gt.INT) == 0:
+                gt_dev.Touch = 1
+
+            gt.GT_Scan(gt_dev, gt_old)
+            if gt_dev.TouchpointFlag:
+                gt_dev.TouchpointFlag = 0
+                raw_x = gt_dev.X[0]
+                raw_y = gt_dev.Y[0]
+                x, y = raw_touch_to_landscape(raw_x, raw_y)
+
+                if x >= SIDEBAR_X0 and (now - last_page_touch) > TOUCH_DEBOUNCE_SECONDS:
+                    if is_inside(UP_BUTTON, x, y):
+                        current_page = (current_page - 1) % len(PAGES)
+                        force_redraw = True
+                        last_page_touch = now
+                    elif is_inside(DOWN_BUTTON, x, y):
+                        current_page = (current_page + 1) % len(PAGES)
+                        force_redraw = True
+                        last_page_touch = now
+
+            time.sleep(0.05)
     except KeyboardInterrupt:
         LOGGER.info("Exiting...")
     finally:
-        epd.sleep()
-        epd.Dev_exit()
+        try:
+            epd.init(epd.FULL_UPDATE)
+            epd.Clear(0xFF)
+            epd.sleep()
+        finally:
+            epd.Dev_exit()
 
 
 if __name__ == "__main__":
