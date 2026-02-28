@@ -195,6 +195,7 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
     force_redraw = True
     next_update_at = 0.0
     last_page_touch = 0.0
+    touch_latched = False
 
     try:
         if simulator:
@@ -229,8 +230,11 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
                 next_update_at = now + UPDATE_INTERVAL_SECONDS
                 force_redraw = False
 
-            if gt.digital_read(gt.INT) == 0:
+            int_is_low = gt.digital_read(gt.INT) == 0
+            if int_is_low:
                 gt_dev.Touch = 1
+            else:
+                touch_latched = False
 
             gt.GT_Scan(gt_dev, gt_old)
             if gt_dev.TouchpointFlag:
@@ -239,15 +243,21 @@ def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
                 raw_y = gt_dev.Y[0]
                 x, y = raw_touch_to_landscape(raw_x, raw_y)
 
-                if x >= SIDEBAR_X0 and (now - last_page_touch) > TOUCH_DEBOUNCE_SECONDS:
+                if (
+                    not touch_latched
+                    and x >= SIDEBAR_X0
+                    and (now - last_page_touch) > TOUCH_DEBOUNCE_SECONDS
+                ):
                     if is_inside(UP_BUTTON, x, y):
                         current_page = (current_page - 1) % len(PAGES)
                         force_redraw = True
                         last_page_touch = now
+                        touch_latched = True
                     elif is_inside(DOWN_BUTTON, x, y):
                         current_page = (current_page + 1) % len(PAGES)
                         force_redraw = True
                         last_page_touch = now
+                        touch_latched = True
 
             time.sleep(0.05)
     except KeyboardInterrupt:
