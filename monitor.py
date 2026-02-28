@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
+import argparse
 import datetime
 import fcntl
 import logging
@@ -12,12 +13,12 @@ import time
 
 from PIL import Image, ImageDraw, ImageFont
 
-libdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+from simulator_backend import create_simulator_runtime
+
 fontdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pic")
+libdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
 if os.path.exists(libdir):
     sys.path.append(libdir)
-
-from TP_lib import epd2in13_V4, gt1151
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -162,11 +163,28 @@ def raw_touch_to_landscape(raw_x, raw_y):
     return (DISPLAY_WIDTH - 1) - raw_y, (DISPLAY_HEIGHT - 1) - raw_x
 
 
-def main():
+def create_runtime(simulator, simulator_host, simulator_port):
+    if simulator:
+        return create_simulator_runtime(
+            simulator_host,
+            simulator_port,
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT,
+            UP_BUTTON,
+            DOWN_BUTTON,
+        )
+
+    from TP_lib import epd2in13_V4, gt1151
+
     epd = epd2in13_V4.EPD()
     gt = gt1151.GT1151()
     gt_dev = gt1151.GT_Development()
     gt_old = gt1151.GT_Development()
+    return epd, gt, gt_dev, gt_old, None
+
+
+def run(simulator=False, simulator_host="127.0.0.1", simulator_port=8765):
+    epd, gt, gt_dev, gt_old, sim_server = create_runtime(simulator, simulator_host, simulator_port)
 
     font_title = load_font(14)
     font_body = load_font(12)
@@ -179,7 +197,11 @@ def main():
     last_page_touch = 0.0
 
     try:
-        LOGGER.info("Initializing Waveshare 2.13 V4 display + touch")
+        if simulator:
+            LOGGER.info("Initializing simulator-backed display + touch")
+        else:
+            LOGGER.info("Initializing Waveshare 2.13 V4 display + touch")
+
         epd.init(epd.FULL_UPDATE)
         gt.GT_Init()
         epd.Clear(0xFF)
@@ -237,6 +259,25 @@ def main():
             epd.sleep()
         finally:
             epd.Dev_exit()
+            if sim_server is not None:
+                sim_server.stop()
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Waveshare monitor display")
+    parser.add_argument("--simulator", action="store_true", help="run without GPIO and serve localhost simulator")
+    parser.add_argument("--simulator-port", type=int, default=8765, help="simulator HTTP port (default: 8765)")
+    parser.add_argument("--simulator-host", default="127.0.0.1", help="simulator bind host (default: 127.0.0.1)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    run(
+        simulator=args.simulator,
+        simulator_host=args.simulator_host,
+        simulator_port=args.simulator_port,
+    )
 
 
 if __name__ == "__main__":
